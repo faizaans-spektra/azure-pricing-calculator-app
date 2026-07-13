@@ -16,6 +16,59 @@ except ImportError:
     easyocr = None
 
 DEFAULT_REGIONS = ["East US", "UAE North", "Central India", "West Europe"]
+AZURE_REGION_OPTIONS = [
+    "East US",
+    "East US 2",
+    "East US 3",
+    "Central US",
+    "North Central US",
+    "South Central US",
+    "West US",
+    "West US 2",
+    "West US 3",
+    "Canada Central",
+    "Canada East",
+    "Brazil South",
+    "Brazil Southeast",
+    "UK South",
+    "UK West",
+    "West Europe",
+    "North Europe",
+    "France Central",
+    "France South",
+    "Germany West Central",
+    "Germany North",
+    "Switzerland North",
+    "Switzerland West",
+    "Norway East",
+    "Norway West",
+    "Sweden Central",
+    "Sweden South",
+    "Italy North",
+    "Spain Central",
+    "Poland Central",
+    "Austria East",
+    "Israel Central",
+    "Qatar Central",
+    "UAE North",
+    "UAE Central",
+    "South Africa North",
+    "South Africa West",
+    "Central India",
+    "South India",
+    "West India",
+    "Southeast Asia",
+    "East Asia",
+    "Japan East",
+    "Japan West",
+    "Korea Central",
+    "Korea South",
+    "Australia East",
+    "Australia Southeast",
+    "Australia Central",
+    "Australia Central 2",
+    "New Zealand North",
+]
 AZURE_PRICING_API = "https://prices.azure.com/api/retail/prices"
 MONTHLY_HOURS_DEFAULT = 730
 
@@ -42,6 +95,8 @@ SUPPORTED_RESOURCE_TYPES = {
     "containers": "Container",
     "containerinstances": "Container Instance",
     "manageddisks": "Managed Disk",
+    "fabric/capacities": "Fabric Capacity",
+    "fabriccapacities": "Fabric Capacity",
 }
 
 COLUMN_ALIASES = {
@@ -79,6 +134,9 @@ RESOURCE_TYPE_SHORTCUTS = {
     "load balancer": "Load Balancer",
     "log analytics": "Log Analytics",
     "application insights": "Application Insights",
+    "fabric": "Fabric Capacity",
+    "fabric capacity": "Fabric Capacity",
+    "fabric capacities": "Fabric Capacity",
 }
 
 MONITORING_RESOURCES = {
@@ -98,6 +156,7 @@ SERVICE_FILTERS = {
     "Load Balancer": "Networking",
     "Log Analytics": "Log Analytics",
     "Application Insights": "Azure Monitor",
+    "Fabric Capacity": "Microsoft Fabric",
 }
 
 # Keep strict matching for compute-like services, but allow intelligent fallback
@@ -110,6 +169,7 @@ STRICT_FALLBACK_SERVICES = {
     "Application Gateway",
     "Azure Firewall",
     "Log Analytics",
+    "Fabric Capacity",
 }
 
 
@@ -752,6 +812,73 @@ def resolve_public_ip_price(sku: str, region: str, allow_devtest: bool = False) 
     )
     best = filtered[0]
     return PriceMatch(item=best, confidence=100, reason=normalize_text(best.get("meterName", "")))
+
+
+def fabric_capacity_units(sku: str) -> int:
+    sku_text = normalize_text(sku).lower().replace(" ", "")
+    match = re.search(r"\bf(\d+)\b", sku_text)
+    if not match:
+        return 1
+    return max(1, maybe_int(match.group(1), 1))
+
+
+def resolve_fabric_capacity_price(sku: str, region: str) -> Optional[PriceMatch]:
+    normalized_region = normalize_region(region)
+    sku_text = normalize_text(sku)
+
+    filters = [
+        f"serviceName eq 'Microsoft Fabric' and armRegionName eq '{normalized_region}' and contains(productName,'Fabric Capacity') and contains(meterName,'Capacity Usage')",
+        f"serviceName eq 'Microsoft Fabric' and armRegionName eq '{normalized_region}' and contains(meterName,'Capacity Usage')",
+    ]
+    if sku_text:
+        filters.insert(0, f"serviceName eq 'Microsoft Fabric' and armRegionName eq '{normalized_region}' and contains(skuName,'{sku_text}')")
+        filters.insert(1, f"serviceName eq 'Microsoft Fabric' and armRegionName eq '{normalized_region}' and contains(meterName,'{sku_text}')")
+
+    candidates: List[Dict[str, Any]] = []
+    for filter_string in filters:
+        try:
+            batch = query_retail_prices(filter_string, max_records=500)
+        except Exception:
+            batch = []
+        if batch:
+            candidates.extend(batch)
+
+    if not candidates:
+        return None
+
+    filtered = []
+    for item in candidates:
+        price_type = normalize_text(item.get("type", ""))
+        if price_type not in {"Consumption", "DevTestConsumption"}:
+            continue
+        if not bool(runtime_option("allow_devtest", False)) and price_type == "DevTestConsumption":
+            continue
+        meter_name = normalize_text(item.get("meterName", "")).lower()
+        product_name = normalize_text(item.get("productName", "")).lower()
+        unit = normalize_text(item.get("unitOfMeasure", "")).lower()
+        if "capacity" not in product_name and "capacity" not in meter_name:
+            continue
+        if "hour" not in unit:
+            continue
+        filtered.append(item)
+
+    if not filtered:
+        return None
+
+    def rank(item: Dict[str, Any]) -> Tuple[int, int, datetime, float]:
+        meter_name = normalize_text(item.get("meterName", "")).lower()
+        usage_bonus = 3 if "capacity usage" in meter_name else 0
+        overage_penalty = -2 if "overage" in meter_name else 0
+        return (
+            usage_bonus + overage_penalty,
+            1 if bool(item.get("isPrimaryMeterRegion", False)) else 0,
+            parse_effective_date(item),
+            -maybe_float(item.get("retailPrice", 0.0), 0.0),
+        )
+
+    filtered.sort(key=rank, reverse=True)
+    best = filtered[0]
+    return PriceMatch(item=best, confidence=95, reason=normalize_text(best.get("meterName", "")))
 
 
 def evaluate_input_quality(entry: Dict[str, Any]) -> Tuple[List[str], List[str]]:
@@ -1475,6 +1602,9 @@ def normalize_arm_resource(resource: Dict[str, Any], disk_lookup: Optional[Dict[
     elif "microsoft.insights/components" in resource_type_text.lower() or "components" in resource_type_text.lower():
         row["SKU"] = normalize_text(sku_name) or "Application Insights"
         row["Resource"] = "Application Insights"
+    elif "microsoft.fabric/capacities" in resource_type_text.lower() or "fabric/capacities" in resource_type_text.lower():
+        row["SKU"] = normalize_text(sku_name) or row["SKU"]
+        row["Resource"] = "Fabric Capacity"
     elif "networkinterfaces" in resource_type_text.lower() or "microsoft.network/networkinterfaces" in resource_type_text.lower():
         row["Resource"] = "Network Interface"
     elif "virtualnetworks" in resource_type_text.lower() or "microsoft.network/virtualnetworks" in resource_type_text.lower():
@@ -1730,6 +1860,22 @@ def price_application_insights(entry: Dict[str, Any], region: str) -> Tuple[floa
     return 0.0, 100, "Monitoring pricing deferred"
 
 
+def price_fabric_capacity(entry: Dict[str, Any], region: str) -> Tuple[float, int, str]:
+    sku = normalize_text(entry.get("SKU", ""))
+    quantity = maybe_int(entry.get("Quantity", 1), 1)
+    hours = maybe_int(entry.get("Hours", MONTHLY_HOURS_DEFAULT), MONTHLY_HOURS_DEFAULT)
+
+    match = resolve_fabric_capacity_price(sku, region)
+    if not match:
+        match = search_prices("Fabric Capacity", sku or "Capacity Usage", region, meter_hint="Capacity Usage")
+    if not match:
+        return 0.0, 0, ""
+
+    cu_multiplier = fabric_capacity_units(sku)
+    price = compute_monthly_units(match.item, quantity * cu_multiplier, hours, 0)
+    return price, match.confidence, match.reason
+
+
 def price_virtual_network(entry: Dict[str, Any], region: str) -> Tuple[float, int, str]:
     return 0.0, 100, "No direct base charge (usage-dependent networking)"
 
@@ -1817,6 +1963,7 @@ PRICING_FUNCTIONS = {
     "Load Balancer": price_load_balancer,
     "Log Analytics": price_log_analytics,
     "Application Insights": price_application_insights,
+    "Fabric Capacity": price_fabric_capacity,
     "Virtual Network": price_virtual_network,
     "Network Interface": price_network_interface,
     "Network Security Group": price_network_security_group,
@@ -1902,7 +2049,7 @@ def main() -> None:
     )
     selected_regions = st.sidebar.multiselect(
         "Select regions for comparison",
-        options=DEFAULT_REGIONS,
+        options=AZURE_REGION_OPTIONS,
         default=DEFAULT_REGIONS[:2],
     )
     custom_region = st.sidebar.text_input("Add custom region", value="")
